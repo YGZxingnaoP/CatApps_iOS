@@ -1,0 +1,17 @@
+NOTICE
+======
+
+`CustomCode/` 是对 [appium/WebDriverAgent](https://github.com/appium/WebDriverAgent)
+的**增量改造**，不含该项目的源码副本。
+
+* 上游项目：WebDriverAgent
+* 上游地址：https://github.com/appium/WebDriverAgent
+* 固定版本：v16.15.0 = e7e2665a00633dc174d7fc579f7e606bc9ba782a
+* 上游版权：Copyright (c) 2015-present, Facebook, Inc. All rights reserved.
+* 上游许可：BSD（全文见本目录 LICENSE）
+
+`CustomCode/` 中与原文件同名的文件，是从上游文件修改而来的衍生作品，同样以 BSD 许可发布，
+并保留上游版权声明与免责声明；未出现在 `CustomCode/` 的文件一律来自上游，按上游许可使用。
+
+WebDriverAgent 是建立在 Apple XCTest 之上的第三方测试工具，与 Apple Inc. 无隶属关系。
+用它构建的 runner 需要自行解决签名（免费 Apple ID 证书 7 天过期）。

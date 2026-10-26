@@ -1,0 +1,12 @@
+# 上游 WDA 是 LF，CustomCode 必须与之一致，否则 patch / 覆盖都会错位
+* text=auto
+
+# 脚本与 CustomCode 一律 LF（Windows 上 clone 也不要转 CRLF）
+*.sh text eol=lf
+CustomCode/** text eol=lf
+Scripts/*.sh text eol=lf
+
+# 这些不能被行尾转换碰到
+*.patch -text
+*.png -text
+*.ipa -text

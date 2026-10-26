@@ -1,0 +1,22 @@
+# 上游 WebDriverAgent：自带 .git，按 commit 引用，不入库
+/WebDriverAgent/
+
+# 内部文档与交接笔记（不公开）
+/Docs/
+
+# 构建产物
+dist/
+build/
+DerivedData/
+*.ipa
+*.xctestrun
+*.log
+*.dSYM/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
