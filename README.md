@@ -284,33 +284,7 @@ iOS 17+ 必须先 `ios tunnel start --userspace`。守护进程负责拔线打 `
 
 还没做：`/source`、屏幕推流（ReplayKit / H.264）、横屏、`.cam` 页自签证书指纹校验、停止的 WS 链路。
 
-## 4. 推到 GitHub 之前
-
-```bat
-git config --global user.name
-git config --global user.email
-```
-
-现在是占位值 `Your Name <you@example.com>`，不改会写进公开提交历史。
-
-```bat
-cd /d "D:\Virtual Machines\connector\WDA"
-git init -b main
-git add -A
-git commit -m "CatCam app + CatPaws /cw/v1 device API on top of WebDriverAgent v16.15.0"
-git remote add origin git@github.com:<你的用户名>/<仓库名>.git
-git push -u origin main
-```
-
-核对清单（应为空 = 上游和内部资料没进库）：
-
-```bat
-git ls-files | find /i "WebDriverAgent\"   :: 只有 CustomCode 下的，不是上游树
-git ls-files | find /i "\Docs\"
-git ls-files | find /i ".ipa"
-```
-
-## 5. 许可
+## 4. 许可
 
 - `CustomCode/` 是对 WebDriverAgent 的改造，沿用上游 **BSD** 许可，版权声明见 `CustomCode/LICENSE`、
   归属说明见 `CustomCode/NOTICE`；
