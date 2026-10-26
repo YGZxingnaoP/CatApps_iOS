@@ -3,6 +3,18 @@
 两个都是**未签名 IPA**，要用重签工具（Sideloadly / iloader 等）配自己的 Apple ID 装。
 runner 与 CatCam 装在同一台手机上：App 走 `127.0.0.1:8100` 回环直连 runner，不需要端口转发。
 
+## 0. 选工具前先知道这几条
+
+折腾过程见 [README §3.3](README.md#33-签名整条链路里最花时间的一环)，这里只留结论：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 日志写 `No-resign mode`，装机到 5% 失败 | Sideloadly 的 `Normal Install` = 不重签；且该设置**每次启动重置** | 先开程序 → 改 `Apple ID Sideload` → 再点 Start |
+| IPA 变成 0 字节 | Sideloadly 签名失败时**截断它打开的文件** | 永远先复制到 `%TEMP%` 再让工具打开，别指向 `dist/` |
+| `Login failed (-80046)` | 本机缺 iTunes 的 `Apple Application Support`（anisette），`Fake Anisette` 灰、`Remote` 付费 | 换工具（本项目最终用 `iloader`） |
+| `Extension X is not part of the main app bundle identifier` | XCTRunner 反向嵌套，扩展 id 不是主 App id 的子域 | 保持脚本默认 `REID=1` |
+| 装完 7 天后启动不了 | 免费 Apple ID 证书过期 | 重签重装；runner id 可能变，别写死 |
+
 ## 1. runner（WebDriverAgent 魔改版）
 
 ```bash
