@@ -11,6 +11,9 @@ struct CWConfig: Equatable {
     var screenBitrate: Int = 1500000
     var allowOCR: Bool = true
     var startInCam: Bool = true
+    /// MeowID：六位编号（000001）或临时身份（temp-000012）；空 = 未设置
+    var meowID: String = ""
+    var camHTTPS: Bool = true
 }
 
 enum CWConfigKey {
@@ -24,8 +27,27 @@ enum CWConfigKey {
     static let screenBitrate = "cw_screen_bitrate"
     static let allowOCR = "cw_allow_ocr"
     static let startInCam = "cw_start_in_cam"
+    static let meowID = "cw_meowid"
+    static let legacyNickname = "cw_nickname"
+    static let camHTTPS = "cw_cam_https"
 
-    static let all = [host, controlPort, videoPort, runnerPort, token, screenFPS, screenMaxEdge, screenBitrate, allowOCR, startInCam]
+    static let all = [host, controlPort, videoPort, runnerPort, token, screenFPS, screenMaxEdge,
+                      screenBitrate, allowOCR, startInCam, meowID, camHTTPS]
+}
+
+extension CWConfig {
+    /// MeowID 规则与主项目 `IdSignupBridge.is_internal_uid` 一致：六位数字 / temp-六位数字
+    static func isValidMeowID(_ value: String) -> Bool {
+        value.range(of: "^(\\d{6}|temp-\\d{6})$", options: .regularExpression) != nil
+    }
+
+    static func normalizedMeowID(_ raw: String) -> String {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return isValidMeowID(text) ? text : ""
+    }
+
+    /// 发给主项目的身份：有 MeowID 用 MeowID，否则沿用 .cam 网页的默认「手机用户」
+    var identity: String { meowID.isEmpty ? "手机用户" : meowID }
 }
 
 extension CWConfig {
@@ -41,6 +63,13 @@ extension CWConfig {
         if let value = defaults.object(forKey: CWConfigKey.screenBitrate) as? Int { config.screenBitrate = value }
         if let value = defaults.object(forKey: CWConfigKey.allowOCR) as? Bool { config.allowOCR = value }
         if let value = defaults.object(forKey: CWConfigKey.startInCam) as? Bool { config.startInCam = value }
+        if let value = defaults.string(forKey: CWConfigKey.meowID) { config.meowID = value }
+        if config.meowID.isEmpty,
+           let legacy = defaults.string(forKey: CWConfigKey.legacyNickname) {
+            // 1.1.0 把「昵称」存在 cw_nickname：如果它本身是合法 MeowID，直接迁移过来
+            config.meowID = CWConfig.normalizedMeowID(legacy)
+        }
+        if let value = defaults.object(forKey: CWConfigKey.camHTTPS) as? Bool { config.camHTTPS = value }
         return config
     }
 
@@ -55,6 +84,8 @@ extension CWConfig {
         defaults.set(screenBitrate, forKey: CWConfigKey.screenBitrate)
         defaults.set(allowOCR, forKey: CWConfigKey.allowOCR)
         defaults.set(startInCam, forKey: CWConfigKey.startInCam)
+        defaults.set(meowID, forKey: CWConfigKey.meowID)
+        defaults.set(camHTTPS, forKey: CWConfigKey.camHTTPS)
     }
 
     static func clear(defaults: UserDefaults = .standard) {
@@ -79,7 +110,18 @@ extension CWConfig {
 
     var controlBaseURL: URL? { CWConfig.baseURL(host: normalizedHost, port: controlPort, scheme: "http") }
     var relayBaseURL: URL? { CWConfig.baseURL(host: normalizedHost, port: videoPort, scheme: "http") }
-    var camBaseURL: URL? { CWConfig.baseURL(host: normalizedHost, port: 8443, scheme: "https") }
+    var camHost: String? {
+        let host = normalizedHost
+        return host.isEmpty ? nil : host
+    }
+    var camPort: Int { camHTTPS ? 8443 : 8445 }
+    var camBaseURL: URL? {
+        CWConfig.baseURL(host: normalizedHost, port: camPort, scheme: camHTTPS ? "https" : "http")
+    }
+    var camWSURL: URL? {
+        CWConfig.baseURL(host: normalizedHost, port: camPort, scheme: camHTTPS ? "wss" : "ws")?
+            .appendingPathComponent("ws")
+    }
     var runnerCWBaseURL: URL {
         let port = runnerPort > 0 ? runnerPort : 8100
         return URL(string: "http://127.0.0.1:\(port)/cw/v1")!

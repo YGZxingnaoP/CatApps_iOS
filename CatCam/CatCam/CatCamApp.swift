@@ -30,8 +30,7 @@ struct CWRootView: View {
                 .navigationViewStyle(.stack)
                 .tabItem { Label("操作", systemImage: "hand.tap") }
                 .tag(1)
-            NavigationView { CWCamView() }
-                .navigationViewStyle(.stack)
+            CWCamNativeView()
                 .tabItem { Label("相机", systemImage: "camera.fill") }
                 .tag(2)
             NavigationView { CWSettingsView() }
@@ -39,10 +38,13 @@ struct CWRootView: View {
                 .tabItem { Label("设置", systemImage: "gearshape.fill") }
                 .tag(3)
         }
-        .overlay(alignment: .bottomTrailing) { stopButton }
+        .overlay(alignment: .bottomTrailing) {
+            if selection != 2 { stopButton }
+        }
         .onAppear {
             if booted { return }
             booted = true
+            selection = store.config.startInCam ? 2 : 0
             Task { await store.selfCheck() }
         }
         .onChange(of: scenePhase) { phase in

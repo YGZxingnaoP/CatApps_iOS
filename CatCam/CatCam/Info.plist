@@ -27,9 +27,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.5</string>
+	<string>1.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>3</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>MinimumOSVersion</key>
@@ -42,11 +42,11 @@
 		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>CatCam 在 .cam 页面里需要相机权限才能预览画面。</string>
+	<string>CatCam 需要相机权限才能把手机画面推给电脑（.cam 观看端 / OBS）。</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>CatCam 需要访问同一局域网内的 CatPaws 服务（8080）与屏幕中继（8081）。</string>
+	<string>CatCam 需要访问同一局域网（或 Tailscale）内的 .cam 服务（8443）与 CatPaws 服务（18110）。</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>CatCam 在 .cam 页面里需要麦克风权限进行语音输入。</string>
+	<string>CatCam 需要麦克风权限：开麦后会把声音送到 .cam 做语音识别，切到后台/锁屏也会继续录音。</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

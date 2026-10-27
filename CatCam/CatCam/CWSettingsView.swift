@@ -7,6 +7,8 @@ struct CWSettingsView: View {
     @State private var controlText: String = ""
     @State private var videoText: String = ""
     @State private var runnerText: String = ""
+    @State private var pinText: String = CWPins.pin
+    @State private var meowText: String = ""
 
     private enum Field: Hashable {
         case host
@@ -14,6 +16,8 @@ struct CWSettingsView: View {
         case video
         case runner
         case token
+        case meowID
+        case pin
     }
 
     var body: some View {
@@ -40,7 +44,77 @@ struct CWSettingsView: View {
                     .focused($focused, equals: .token)
             }
 
-            Section(header: Text("屏幕流"), footer: Text("推流尚未接入，这里只保存参数。")) {
+            Section(header: Text("身份（用户模式）"),
+                    footer: Text("MeowID 是主项目身份表里的编号：六位数字（000001）或临时身份（temp-000012），留空 = 手机用户。昵称不由 App 填，连接后自动从 `/api/who` 读取。")) {
+                HStack {
+                    Text("MeowID")
+                    Spacer()
+                    TextField("000001", text: $meowText)
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                        .keyboardType(.asciiCapable)
+                        .focused($focused, equals: .meowID)
+                        .onChange(of: meowText) { value in
+                            commitMeowID(value)
+                        }
+                }
+                if !meowText.isEmpty, CWConfig.normalizedMeowID(meowText).isEmpty {
+                    Text("格式不对：要 6 位数字，或 temp-6 位数字")
+                        .font(.caption)
+                        .foregroundColor(CWTheme.coral)
+                }
+                HStack {
+                    Text("当前身份")
+                    Spacer()
+                    Text(store.config.identity)
+                        .foregroundColor(CWTheme.sub)
+                }
+                HStack {
+                    Text("识别到的昵称")
+                    Spacer()
+                    Text(CWLive.shared.nameLabel)
+                        .foregroundColor(CWTheme.sub)
+                }
+            }
+
+            Section(header: Text("相机（.cam）"),
+                    footer: Text("证书指纹固定：留空 = 首次连接自动学习并固定；填了就必须逐字一致（可从 .vendor/.cam/cert/cert.pem 的 SHA-256 得到）。")) {
+                Toggle("用 HTTPS / WSS（8443）", isOn: $store.config.camHTTPS)
+                HStack {
+                    Text("已固定指纹")
+                    Spacer()
+                    Text(CWPins.pin.isEmpty ? "（未固定）" : short(CWPins.pin))
+                        .font(.caption.monospaced())
+                        .foregroundColor(CWTheme.sub)
+                }
+                HStack {
+                    Text("最近一次看到")
+                    Spacer()
+                    Text(CWPins.lastSeen.isEmpty ? "—" : short(CWPins.lastSeen))
+                        .font(.caption.monospaced())
+                        .foregroundColor(CWTheme.sub)
+                }
+                TextField("64 位十六进制指纹", text: $pinText)
+                    .textInputAutocapitalization(.never)
+                    .disableAutocorrection(true)
+                    .font(.caption.monospaced())
+                    .focused($focused, equals: .pin)
+                    .onChange(of: pinText) { value in
+                        let normalized = CWPins.normalize(value)
+                        if normalized.isEmpty || normalized.count == 64 {
+                            CWPins.pin = normalized
+                        }
+                    }
+                Button {
+                    pinText = ""
+                    CWPins.pin = ""
+                } label: {
+                    Label("清空指纹（下次连接重新学习）", systemImage: "lock.open")
+                }
+            }
+
+            Section(header: Text("屏幕流"), footer: Text("相机推流按 .cam 的 1280×720 / 30fps / 2Mbps 固定，这里的参数只用于截图。")) {
                 Stepper(value: $store.config.screenFPS, in: 5...20) {
                     HStack {
                         Text("fps")
@@ -84,7 +158,7 @@ struct CWSettingsView: View {
                 .disabled(store.busy)
             }
 
-            Section(footer: Text("配置即时保存到 UserDefaults：cw_pc_host / cw_control_port / cw_video_port / cw_runner_port / cw_token / cw_screen_fps / cw_screen_max_edge / cw_screen_bitrate / cw_allow_ocr / cw_start_in_cam")) {
+            Section(footer: Text("配置即时保存到 UserDefaults：cw_pc_host / cw_control_port / cw_video_port / cw_runner_port / cw_token / cw_meowid / cw_cam_https / cw_cam_pin（指纹）/ cw_cam_volume / cw_cam_muted")) {
                 EmptyView()
             }
         }
@@ -141,6 +215,29 @@ struct CWSettingsView: View {
         if Int(runnerText) != store.config.runnerPort {
             runnerText = String(store.config.runnerPort)
         }
+        if pinText != CWPins.pin {
+            pinText = CWPins.pin
+        }
+        if meowText != store.config.meowID {
+            meowText = store.config.meowID
+        }
+    }
+
+    /// MeowID 只在「空」或「格式合法」时落盘，避免边打边存半截编号
+    private func commitMeowID(_ raw: String) {
+        let normalized = CWConfig.normalizedMeowID(raw)
+        if raw.isEmpty {
+            store.config.meowID = ""
+            CWLive.shared.applyIdentity("")
+        } else if !normalized.isEmpty {
+            store.config.meowID = normalized
+            CWLive.shared.applyIdentity(normalized)
+        }
+    }
+
+    private func short(_ value: String) -> String {
+        guard value.count > 20 else { return value }
+        return "\(value.prefix(8))…\(value.suffix(8))"
     }
 }
 
