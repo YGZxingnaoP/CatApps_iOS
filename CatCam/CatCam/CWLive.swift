@@ -12,6 +12,8 @@ final class CWLink: NSObject, URLSessionDelegate, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var stopped = true
     private var retry = 0
+    private var generation = 0
+    private var reconnectScheduled = false
     private var inflight = 0
     private let lock = NSLock()
 
@@ -33,35 +35,49 @@ final class CWLink: NSObject, URLSessionDelegate, URLSessionWebSocketDelegate {
 
     var isOpen: Bool { task?.state == .running }
 
-    /// 是否已经交给它一个连接（连接中/已连上都算），避免 configure 反复重连
-    var isActive: Bool { !stopped && task != nil }
+    /// 是否已经交给它一个连接（连接中/已连上/等待重连都算），避免 configure 反复重连
+    var isActive: Bool { !stopped && (task != nil || reconnectScheduled) }
 
     func start(url: URL) {
+        generation += 1
+        reconnectScheduled = false
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         self.url = url
         stopped = false
         retry = 0
-        open()
+        resetInflight()
+        open(generation)
     }
 
     func stop() {
+        generation += 1
+        reconnectScheduled = false
         stopped = true
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
+        resetInflight()
     }
 
-    private func open() {
-        guard !stopped, let url else { return }
+    private func open(_ gen: Int) {
+        guard !stopped, gen == generation, let url else { return }
+        task?.cancel(with: .goingAway, reason: nil)
+        resetInflight()
         let next = session.webSocketTask(with: url)
         task = next
         next.resume()
-        listen(next)
+        listen(next, gen)
     }
 
-    private func listen(_ t: URLSessionWebSocketTask) {
+    private func resetInflight() {
+        lock.lock()
+        inflight = 0
+        lock.unlock()
+    }
+
+    private func listen(_ t: URLSessionWebSocketTask, _ gen: Int) {
         t.receive { [weak self, weak t] result in
-            guard let self, let t, self.task === t else { return }
+            guard let self, let t, self.task === t, gen == self.generation else { return }
             switch result {
             case .success(let message):
                 switch message {
@@ -75,21 +91,26 @@ final class CWLink: NSObject, URLSessionDelegate, URLSessionWebSocketDelegate {
                 @unknown default:
                     break
                 }
-                self.listen(t)
+                self.listen(t, gen)
             case .failure(let error):
-                self.dropped(error.localizedDescription)
+                self.dropped(error.localizedDescription, gen)
             }
         }
     }
 
-    private func dropped(_ reason: String) {
-        guard !stopped else { return }
+    private func dropped(_ reason: String, _ gen: Int) {
+        guard !stopped, gen == generation, !reconnectScheduled else { return }
+        reconnectScheduled = true
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
         onState?(false, reason)
         let delays: [Double] = [1, 2, 5, 10, 30]
         let delay = delays[min(retry, delays.count - 1)]
         retry += 1
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.open()
+            guard let self, !self.stopped, gen == self.generation else { return }
+            self.reconnectScheduled = false
+            self.open(gen)
         }
     }
 
@@ -126,16 +147,23 @@ final class CWLink: NSObject, URLSessionDelegate, URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession,
                     webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
-        retry = 0
+        guard webSocketTask === task else { return }
         onState?(true, "已连接")
         onOpen?()
+        // 连接稳定 10 秒才把退避清零，避免“连上就断”的 1 秒风暴
+        let gen = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, gen == self.generation, self.isOpen else { return }
+            self.retry = 0
+        }
     }
 
     func urlSession(_ session: URLSession,
                     webSocketTask: URLSessionWebSocketTask,
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                     reason: Data?) {
-        dropped("已断开（\(closeCode.rawValue)）")
+        guard webSocketTask === task else { return }
+        dropped("已断开（\(closeCode.rawValue)）", generation)
     }
 }
 
@@ -145,6 +173,7 @@ final class CWCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     private let output = AVCaptureVideoDataOutput()
     private let frames = DispatchQueue(label: "cw.camera.frames")
+    private let control = DispatchQueue(label: "cw.camera.control")
     private var input: AVCaptureDeviceInput?
     private var configured = false
     private(set) var position: AVCaptureDevice.Position = .back
@@ -152,7 +181,37 @@ final class CWCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
 
+    override init() {
+        super.init()
+        // 关键：相机不要自动配置 App 的音频会话，否则会和麦克风/播放互相打断
+        session.automaticallyConfiguresApplicationAudioSession = false
+        let center = NotificationCenter.default
+        center.addObserver(forName: .AVCaptureSessionWasInterrupted, object: session, queue: .main) { note in
+            let raw = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? UInt) ?? 0
+            NSLog("[CatCam] 相机会话被打断 reason=%d", raw)
+        }
+        center.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: session, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.control.async {
+                guard self.isRunning, !self.session.isRunning else { return }
+                self.session.startRunning()
+            }
+        }
+        center.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] note in
+            NSLog("[CatCam] 相机会话错误：%@", String(describing: note.userInfo))
+            guard let self else { return }
+            self.control.async {
+                guard self.isRunning, !self.session.isRunning else { return }
+                self.session.startRunning()
+            }
+        }
+    }
+
     func start(position: AVCaptureDevice.Position) throws {
+        try control.sync { try startLocked(position: position) }
+    }
+
+    private func startLocked(position: AVCaptureDevice.Position) throws {
         if !configured {
             try configure(position: position)
             configured = true
@@ -164,6 +223,10 @@ final class CWCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     func stop() {
+        control.sync { stopLocked() }
+    }
+
+    private func stopLocked() {
         if session.isRunning {
             session.stopRunning()
         }
@@ -171,6 +234,10 @@ final class CWCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     func switchTo(position: AVCaptureDevice.Position) throws {
+        try control.sync { try switchLocked(position: position) }
+    }
+
+    private func switchLocked(position: AVCaptureDevice.Position) throws {
         guard configured else {
             try configure(position: position)
             configured = true
@@ -283,6 +350,7 @@ final class CWVideoEncoder {
     private var fps = 30
     private var bitrate = 2_000_000
     private let lock = NSLock()
+    private let sessionLock = NSRecursiveLock()
     private let queue = DispatchQueue(label: "cw.encoder")
 
     var onConfig: ((Int, Int) -> Void)?
@@ -295,6 +363,8 @@ final class CWVideoEncoder {
     }
 
     func configure(width: Int, height: Int) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
         invalidate()
         var created: VTCompressionSession?
         let status = VTCompressionSessionCreate(
@@ -331,6 +401,8 @@ final class CWVideoEncoder {
     }
 
     func invalidate() {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
         if let session {
             VTCompressionSessionInvalidate(session)
         }
@@ -348,6 +420,8 @@ final class CWVideoEncoder {
     }
 
     func encode(_ buffer: CVPixelBuffer, pts: CMTime) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
         let width = CVPixelBufferGetWidth(buffer)
         let height = CVPixelBufferGetHeight(buffer)
         if session == nil || size.0 != width || size.1 != height {
@@ -475,29 +549,38 @@ final class CWAudioHub {
     private var tapInstalled = false
     private var inputHandler: ((AVAudioPCMBuffer) -> Void)?
     private var recording = false
+    private var downgradeWork: DispatchWorkItem?
     private var pending = 0
     private var lastEnd = Date.distantPast
     private let lock = NSLock()
+    /// 所有 AVAudioEngine / AVAudioSession 操作都在这条串行队列上，绝不占主线程
+    private let queue = DispatchQueue(label: "cw.audio.engine")
 
     private init() {}
 
     // MARK: 输出
 
-    func play(_ data: Data, sampleRate: Double) -> Bool {
+    func play(_ data: Data, sampleRate: Double) {
+        queue.async { [weak self] in
+            self?.playLocked(data, sampleRate: sampleRate)
+        }
+    }
+
+    private func playLocked(_ data: Data, sampleRate: Double) {
         guard data.count >= 2,
               let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else {
-            return false
+            return
         }
         do {
             try preparePlayer(format)
         } catch {
             NSLog("[CatCam] 播放引擎启动失败：%@", error.localizedDescription)
-            return false
+            return
         }
         let frames = data.count / 2
         guard frames > 0,
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)) else {
-            return false
+            return
         }
         buffer.frameLength = AVAudioFrameCount(frames)
         data.withUnsafeBytes { raw in
@@ -523,7 +606,6 @@ final class CWAudioHub {
         if !player.isPlaying {
             player.play()
         }
-        return true
     }
 
     private func preparePlayer(_ format: AVAudioFormat) throws {
@@ -551,38 +633,40 @@ final class CWAudioHub {
 
     // MARK: 输入
 
-    @discardableResult
-    func beginRecording(_ handler: @escaping (AVAudioPCMBuffer) -> Void) throws -> Double {
+    func beginRecording(_ handler: @escaping (AVAudioPCMBuffer) -> Void,
+                        completion: @escaping (Result<Double, Error>) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let rate = try self.beginRecordingLocked(handler)
+                DispatchQueue.main.async { completion(.success(rate)) }
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }
+    }
+
+    private func beginRecordingLocked(_ handler: @escaping (AVAudioPCMBuffer) -> Void) throws -> Double {
+        // 关麦后 2 秒内又开：取消“切回 playback”的延迟任务，会话保持热的
+        downgradeWork?.cancel()
+        downgradeWork = nil
         let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playAndRecord,
-                                    mode: .voiceChat,
-                                    options: [.defaultToSpeaker, .allowBluetooth])
-        } catch {
-            throw NSError(domain: "CatCam", code: 11, userInfo: [NSLocalizedDescriptionKey:
-                "音频会话切不到录音：\(error.localizedDescription)"])
-        }
-        do {
-            try session.setActive(true)
-        } catch {
-            throw NSError(domain: "CatCam", code: 12, userInfo: [NSLocalizedDescriptionKey:
-                "音频会话激活失败：\(error.localizedDescription)"])
-        }
+        try activateForRecording(session)
 
         if engine.isRunning {
             engine.stop()
         }
+        // 停止后先 reset，再重新拿 inputNode 格式；否则很容易拿到 0 声道导致 installTap 抛异常
+        engine.reset()
         resetPending()
 
-        // 引擎之前可能跑的是播放图（mainMixer 已建），切类别后 inputNode 的格式
-        // 有时仍是 0 声道；换一个干净引擎能可靠拿到新的输入格式。
         var format = inputFormat()
         if !isUsable(format) {
             rebuildEngine()
             format = inputFormat()
         }
         var attempts = 0
-        while !isUsable(format) && attempts < 10 {
+        while !isUsable(format) && attempts < 25 {
             Thread.sleep(forTimeInterval: 0.08)
             format = inputFormat()
             attempts += 1
@@ -634,40 +718,93 @@ final class CWAudioHub {
     }
 
     func endRecording() {
+        queue.async { [weak self] in
+            self?.endRecordingLocked()
+        }
+    }
+
+    /// 切录音类别可能被相机/系统短暂占用，重试几次再报错
+    private func activateForRecording(_ session: AVAudioSession) throws {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                // measurement：原始麦克风数据，系统不加 AGC/降噪（voiceChat 会把小声压得很低）
+                try session.setCategory(.playAndRecord,
+                                        mode: .measurement,
+                                        options: [.defaultToSpeaker, .allowBluetooth])
+                try session.setActive(true)
+                return
+            } catch {
+                lastError = error
+                if attempt < 2 {
+                    Thread.sleep(forTimeInterval: 0.12)
+                }
+            }
+        }
+        throw NSError(domain: "CatCam", code: 11, userInfo: [NSLocalizedDescriptionKey:
+            "音频会话切不到录音：\(lastError?.localizedDescription ?? "未知错误")"])
+    }
+
+    private func endRecordingLocked() {
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
         inputHandler = nil
         recording = false
-        setRecordingCategory(false)
         if engine.isRunning {
             engine.stop()
         }
         resetPending()
         try? startIfNeeded()
+        // 不立刻切回 playback：留 2 秒热窗口，关麦后马上重开不会和 setCategory/setActive 抢会话。
+        // 2 秒内没再开，再降回 playback（省电、释放麦克风指示）。
+        downgradeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.recording else { return }
+                self.setRecordingCategory(false)
+            }
+        }
+        downgradeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
     }
 
     var isPlaying: Bool {
-        guard player.volume > 0.001 else { return false }
+        guard lastVolume > 0.001 else { return false }
         lock.lock()
-        let value = pending > 0 || Date() < lastEnd
+        // 只看“最后一次排入播放块的时间”：pending 万一因为引擎停/路由切换没收到完成回调，
+        // 也不能把麦克风闸门永久锁死（这是“麦克风开着但一帧都不发”的元凶）。
+        let value = Date() < lastEnd
         lock.unlock()
         return value
     }
 
     var volume: Float {
-        get { player.volume }
+        get { lastVolume }
         set {
             lastVolume = newValue
-            player.volume = newValue
+            queue.async { [weak self] in
+                self?.player.volume = newValue
+            }
         }
     }
 
     /// 回到前台 / 打断结束 / 路由变化后重新拉起（空图不启动，避免 prepare() 抛异常）
     func reactivate() {
+        queue.async { [weak self] in
+            self?.reactivateLocked()
+        }
+    }
+
+    private func reactivateLocked() {
         if !recording {
             setRecordingCategory(false)
+        }
+        if !engine.isRunning {
+            // 引擎停过的话，之前排队的播放块不会再有完成回调，不清会把麦克风永久闸住
+            resetPending()
         }
         try? startIfNeeded()
         if playerConnected && !player.isPlaying {
@@ -692,7 +829,7 @@ final class CWAudioHub {
     private func setRecordingCategory(_ on: Bool) {
         let session = AVAudioSession.sharedInstance()
         let category: AVAudioSession.Category = on ? .playAndRecord : .playback
-        let mode: AVAudioSession.Mode = on ? .voiceChat : .default
+        let mode: AVAudioSession.Mode = on ? .measurement : .default
         if session.category == category, session.mode == mode {
             try? session.setActive(true)
             return
@@ -714,32 +851,103 @@ final class CWAudioHub {
 
 final class CWMic {
     private var running = false
+    private var starting = false
+    private var wanted = false
+    private var generation = 0
     private var pending = Data()
     private(set) var rate: Double = 48000
 
     var onPCM: ((Data, Double) -> Void)?
     var isGated: (() -> Bool)?
 
-    func start() throws {
-        guard !running else { return }
-        rate = try CWAudioHub.shared.beginRecording { [weak self] buffer in
-            self?.handle(buffer)
+    /// 异步启动：引擎操作在音频串行队列上，主线程只收回调，不会卡 UI
+    func start(completion: @escaping (Error?) -> Void) {
+        wanted = true
+        if running {
+            completion(nil)
+            return
         }
-        pending.removeAll()
-        running = true
+        if starting {
+            // 已有一次启动在路上，别重复入队；它完成时会回调最初的调用方
+            completion(nil)
+            return
+        }
+        generation += 1
+        let gen = generation
+        starting = true
+        CWAudioHub.shared.beginRecording({ [weak self] buffer in
+            self?.handle(buffer)
+        }, completion: { [weak self] result in
+            guard let self else { return }
+            guard gen == self.generation else {
+                // 这一轮已经被 stop/restart 取代，丢弃结果
+                completion(nil)
+                return
+            }
+            self.starting = false
+            switch result {
+            case .success(let rate):
+                self.rate = rate
+                self.pending.removeAll()
+                if self.wanted {
+                    self.running = true
+                    completion(nil)
+                } else {
+                    CWAudioHub.shared.endRecording()
+                    completion(nil)
+                }
+            case .failure(let error):
+                self.wanted = false
+                completion(error)
+            }
+        })
     }
 
     func stop() {
-        guard running else { return }
-        CWAudioHub.shared.endRecording()
+        generation += 1
+        wanted = false
+        starting = false
         running = false
+        CWAudioHub.shared.endRecording()
         pending.removeAll()
     }
 
     func restart() {
-        guard running else { return }
+        guard running || wanted else { return }
         stop()
-        try? start()
+        start { _ in }
+    }
+
+    /// 轻量 AGC：目标 RMS 1200，最多 4 倍（+12 dB），带 40 的噪声门和起音/释放平滑。
+    /// 正常/大声说话基本在 1~1.5 倍，不会削顶；安静段才逐步加到 4 倍。
+    private var inputGain: Double = 1.0
+
+    private func applyInputGain(_ samples: inout [Int16]) {
+        let n = samples.count
+        guard n > 0 else { return }
+        var sum = 0.0
+        for value in samples {
+            let d = Double(value)
+            sum += d * d
+        }
+        let rms = (sum / Double(n)).squareRoot()
+        let target = 1200.0
+        var desired = 1.0
+        if rms >= 40 {
+            desired = min(4.0, max(1.0, target / rms))
+        }
+        // 起音快一点，释放慢一点，避免音量忽大忽小
+        if desired > inputGain {
+            inputGain = inputGain * 0.6 + desired * 0.4
+        } else {
+            inputGain = inputGain * 0.85 + desired * 0.15
+        }
+        inputGain = min(4.0, max(1.0, inputGain))
+        guard inputGain > 1.01 else { return }
+        for index in 0..<n {
+            let value = Double(samples[index]) * inputGain
+            samples[index] = Int16(max(-30000, min(30000, value.rounded())))
+        }
     }
 
     private func handle(_ buffer: AVAudioPCMBuffer) {
@@ -761,6 +969,7 @@ final class CWMic {
         } else {
             return
         }
+        applyInputGain(&int16)
         if let gated = isGated?(), gated {
             pending.removeAll()
             return
@@ -786,8 +995,8 @@ final class CWAudioSession {
 
     /// 来电/Siri 打断结束后，让上层把引擎重新拉起来
     var onInterruptionEnded: (() -> Void)?
-    /// 路由变化（插拔耳机/蓝牙）后，输入格式可能失效，需要重装 tap
-    var onRouteChanged: (() -> Void)?
+    /// 真正的设备路由变化（插拔耳机/蓝牙）才回调；自己的 setCategory 引发的 categoryChange 不算
+    var onRouteChanged: ((UInt) -> Void)?
 
     private init() {
         let center = NotificationCenter.default
@@ -805,7 +1014,14 @@ final class CWAudioSession {
                                            object: nil, queue: .main) { [weak self] note in
             let raw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
             NSLog("[CatCam] 音频路由变化 reason=%d", raw)
-            self?.onRouteChanged?()
+            let reason = AVAudioSession.RouteChangeReason(rawValue: raw) ?? .unknown
+            // 关键：categoryChange / routeConfigurationChange 是我们自己切类别引起的，
+            // 再触发 mic.restart 会形成死循环（音量条抖动 + 麦克风永远在重装 tap）
+            let meaningful: Set<AVAudioSession.RouteChangeReason> = [
+                .newDeviceAvailable, .oldDeviceUnavailable, .override, .noSuitableRouteForCategory
+            ]
+            guard meaningful.contains(reason) else { return }
+            self?.onRouteChanged?(raw)
         })
     }
 
@@ -939,7 +1155,7 @@ final class CWTtsPlayer {
     }
 
     private func schedule(_ data: Data, sampleRate: Double) {
-        _ = CWAudioHub.shared.play(data, sampleRate: sampleRate)
+        CWAudioHub.shared.play(data, sampleRate: sampleRate)
     }
 }
 
@@ -1098,6 +1314,7 @@ final class CWLive: ObservableObject {
     private var wsURL: URL?
     private var appliedConfig: CWConfig?
     private var configuredKey = ""
+    private var endpointWork: DispatchWorkItem?
     private var started = false
     private var cameraPreferred = false
     private var micWanted = false
@@ -1109,6 +1326,7 @@ final class CWLive: ObservableObject {
     private var fpsStamp = Date()
     private var lineHideAt: Date?
     private var hintHideAt: Date?
+    private var lastRouteFix = Date.distantPast
     private var clearTimer: Timer?
 
     private init() {}
@@ -1131,6 +1349,8 @@ final class CWLive: ObservableObject {
         }
 
         guard let host = config.camHost else {
+            endpointWork?.cancel()
+            endpointWork = nil
             configuredKey = ""
             base = nil
             wsURL = nil
@@ -1143,38 +1363,66 @@ final class CWLive: ObservableObject {
             return
         }
 
-        // 地址/协议变了才重算 URL；身份变化不需要重连
+        // 地址/协议变了：0.4s 防抖再重连，避免在设置里逐字输入 IP 时把链路反复掐断
         let key = "\(host)|\(config.camHTTPS)"
-        let changed = key != configuredKey
-        if changed {
-            configuredKey = key
-            let scheme = config.camHTTPS ? "https" : "http"
-            let wsScheme = config.camHTTPS ? "wss" : "ws"
-            let port = config.camHTTPS ? 8443 : 8445
-            base = URL(string: "\(scheme)://\(host):\(port)")
-            wsURL = URL(string: "\(wsScheme)://\(host):\(port)/ws")
-            player.base = base
-            chat.base = base
-            modeClient.base = base
+        if key == configuredKey {
+            endpointWork?.cancel()
+            endpointWork = nil
+            ensureLinks()
+            refreshNickname()
+            return
         }
+        endpointWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.applyEndpoint(config)
+        }
+        endpointWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
 
-        // 已经 start 过就确保持续在连：不依赖 key 是否变化
-        if started, let wsURL {
-            if changed {
-                stopLinks()
-            }
-            if !videoLink.isActive {
+    private func applyEndpoint(_ config: CWConfig) {
+        endpointWork = nil
+        guard let host = config.camHost else {
+            configuredKey = ""
+            base = nil
+            wsURL = nil
+            stopLinks()
+            return
+        }
+        let key = "\(host)|\(config.camHTTPS)"
+        guard key != configuredKey else {
+            ensureLinks()
+            return
+        }
+        configuredKey = key
+        let scheme = config.camHTTPS ? "https" : "http"
+        let wsScheme = config.camHTTPS ? "wss" : "ws"
+        let port = config.camHTTPS ? 8443 : 8445
+        base = URL(string: "\(scheme)://\(host):\(port)")
+        wsURL = URL(string: "\(wsScheme)://\(host):\(port)/ws")
+        player.base = base
+        chat.base = base
+        modeClient.base = base
+        if started {
+            stopLinks()
+            if let wsURL {
                 videoLink.start(url: wsURL)
-            }
-            if !audioLink.isActive {
                 audioLink.start(url: wsURL)
             }
-            if changed {
-                modeClient.load()
-            }
+            modeClient.load()
         }
         logSink?("推流目标：\(wsURL?.absoluteString ?? "（空）")")
         refreshNickname()
+    }
+
+    private func ensureLinks() {
+        guard started, let wsURL else { return }
+        if !videoLink.isActive {
+            videoLink.start(url: wsURL)
+        }
+        if !audioLink.isActive {
+            audioLink.start(url: wsURL)
+        }
     }
 
     private func stopLinks() {
@@ -1256,12 +1504,17 @@ final class CWLive: ObservableObject {
         CWAudioSession.shared.onInterruptionEnded = { [weak self] in
             guard let self else { return }
             self.player.reactivate()
-            if self.micOn { self.mic.restart() }
+            if self.micOn, Date().timeIntervalSince(self.lastRouteFix) > 1.5 {
+                self.lastRouteFix = Date()
+                self.mic.restart()
+            }
         }
-        CWAudioSession.shared.onRouteChanged = { [weak self] in
-            guard let self else { return }
+        CWAudioSession.shared.onRouteChanged = { [weak self] _ in
+            guard let self, self.micOn else { return }
+            guard Date().timeIntervalSince(self.lastRouteFix) > 1.5 else { return }
+            self.lastRouteFix = Date()
             self.player.reactivate()
-            if self.micOn { self.mic.restart() }
+            self.mic.restart()
         }
         CWPins.onEvent = { [weak self] note in
             self?.publish {
@@ -1330,10 +1583,12 @@ final class CWLive: ObservableObject {
         encoder.onConfig = { [weak self] width, height in
             guard let self else { return }
             self.videoSize = (width, height)
-            self.videoLink.send(json: self.vcfg((width, height)))
+            if self.cameraOn {
+                self.videoLink.send(json: self.vcfg((width, height)))
+            }
         }
         encoder.onPacket = { [weak self] data, key, micros in
-            guard let self else { return }
+            guard let self, self.cameraOn else { return }
             var frame = Data(capacity: data.count + 10)
             frame.append(0x01)
             frame.append(key ? 1 : 0)
@@ -1411,6 +1666,11 @@ final class CWLive: ObservableObject {
                 do {
                     try self.camera.start(position: self.cameraPosition)
                     self.publish { self.cameraOn = true }
+                    if let size = self.videoSize {
+                        self.videoLink.send(json: self.vcfg(size))
+                    }
+                    // 相机起来后把音频引擎/会话重新拉一次，避免被相机会话的旧配置拖死
+                    CWAudioHub.shared.reactivate()
                 } catch {
                     self.fail("相机启动失败：\(error.localizedDescription)")
                 }
@@ -1420,10 +1680,11 @@ final class CWLive: ObservableObject {
 
     private func stopVideo() {
         DispatchQueue.global(qos: .userInitiated).async {
+            // 先停相机（control 队列保证与 start/switch 串行），再废编码器，避免边停边编码
             self.camera.stop()
+            self.encoder.invalidate()
         }
         videoLink.send(json: ["t": "vstop"])
-        encoder.invalidate()
         videoSize = nil
         publish { self.cameraOn = false }
     }
@@ -1440,14 +1701,18 @@ final class CWLive: ObservableObject {
     }
 
     func toggleMic() {
+        // 关：UI 立刻响应，音频引擎在串行队列里慢慢收拾，绝不阻塞主线程
         if micOn || micWanted {
             micWanted = false
             mic.stop()
-            publish { self.micOn = false }
+            publish {
+                self.micOn = false
+                self.hint = "麦克风已关闭"
+                self.hintHideAt = Date().addingTimeInterval(2)
+            }
             return
         }
         micWanted = true
-        CWAudioSession.shared.activate()
         AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
             guard let self else { return }
             guard granted else {
@@ -1456,24 +1721,33 @@ final class CWLive: ObservableObject {
                 return
             }
             guard self.micWanted else { return }
-            // 音频引擎/会话操作统一放主线程，避免和 TTS 播放（主线程 schedule）抢引擎
-            DispatchQueue.main.async {
-                guard self.micWanted else { return }
-                do {
-                    // 先把会话采样率告诉服务端，再启动引擎：避免第一帧 PCM 先于 acfg 到达
-                    let expected = AVAudioSession.sharedInstance().sampleRate
-                    if expected > 0 {
-                        self.audioLink.send(json: ["t": "acfg", "rate": expected, "ch": 1])
-                    }
-                    try self.mic.start()
-                    if abs(self.mic.rate - expected) > 0.5 {
-                        self.audioLink.send(json: ["t": "acfg", "rate": self.mic.rate, "ch": 1])
-                    }
-                    self.publish { self.micOn = true }
-                } catch {
+            // 先把会话采样率告诉服务端，再启动引擎（start 内部把引擎操作丢到音频队列）
+            let expected = AVAudioSession.sharedInstance().sampleRate
+            if expected > 0 {
+                self.audioLink.send(json: ["t": "acfg", "rate": expected, "ch": 1])
+            }
+            self.mic.start { error in
+                if let error {
                     self.micWanted = false
+                    self.mic.stop()
                     self.fail("麦克风启动失败：\(error.localizedDescription)")
+                    return
                 }
+                if abs(self.mic.rate - expected) > 0.5 {
+                    self.audioLink.send(json: ["t": "acfg", "rate": self.mic.rate, "ch": 1])
+                }
+                if self.micWanted {
+                    self.publish { self.micOn = true }
+                } else {
+                    self.mic.stop()
+                }
+            }
+            // 看门狗：6 秒还没起来就复位，避免“关一次以后再也打不开”
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                guard let self, self.micWanted, !self.micOn else { return }
+                self.micWanted = false
+                self.mic.stop()
+                self.fail("麦克风启动超时（已复位，请再点一次）")
             }
         }
     }
